@@ -19,7 +19,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from queue import Empty, Queue
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import streamlit as st
@@ -125,6 +125,10 @@ GOALS_PATH = Path(__file__).with_name("goals") / "personal_goals.md"
 GOALS_MAX_CHARS = 20000
 GOALS_PREVIEW_CHARS = 600
 MAX_GOAL_SEARCH_CALLS_PER_MESSAGE = 2
+POLLINATIONS_BASE_URL = "https://image.pollinations.ai/prompt/"
+IMAGE_WIDTH = 1024
+IMAGE_HEIGHT = 1024
+MAX_IMAGE_CALLS_PER_MESSAGE = 2
 MOVIE_AGENT_ENV_PATH = Path.home() / "Documents" / "movie-agent" / ".env"
 KST = timezone(timedelta(hours=9), "KST")
 SEARCH_TIMINGS: contextvars.ContextVar[list[dict[str, object]] | None] = (
@@ -154,6 +158,12 @@ GOALS_TIMINGS: contextvars.ContextVar[list[dict[str, object]] | None] = (
 GOAL_SEARCH_CALL_COUNT: contextvars.ContextVar[list[int] | None] = (
     contextvars.ContextVar("GOAL_SEARCH_CALL_COUNT", default=None)
 )
+IMAGE_RESULTS: contextvars.ContextVar[list[dict[str, object]] | None] = (
+    contextvars.ContextVar("IMAGE_RESULTS", default=None)
+)
+IMAGE_CALL_COUNT: contextvars.ContextVar[list[int] | None] = (
+    contextvars.ContextVar("IMAGE_CALL_COUNT", default=None)
+)
 STOP_EVENTS: dict[str, threading.Event] = {}
 WEB_SEARCH_HINTS = (
     "아침",
@@ -177,6 +187,14 @@ WEB_SEARCH_HINTS = (
     "조언",
     "검색",
     "찾아",
+    "그려",
+    "그림",
+    "이미지",
+    "비전보드",
+    "비전 보드",
+    "포스터",
+    "축하",
+    "달성",
     "habit",
     "routine",
     "motivation",
@@ -186,6 +204,10 @@ WEB_SEARCH_HINTS = (
     "goal",
     "tips",
     "search",
+    "image",
+    "poster",
+    "draw",
+    "vision board",
 )
 
 set_tracing_disabled(True)
@@ -242,9 +264,10 @@ Your job:
 SEARCH_AGENT_INSTRUCTIONS = """
 You are a research planner for a Korean life coach.
 
-You may have up to two tools:
+You may have up to three tools:
 - search_goals: search the user's personal goal and journal document.
 - search_web: search the public web for tips and evidence.
+- generate_image: create a motivational image, vision board, or celebration poster.
 
 Your job:
 - If the search_goals tool is available, call it FIRST to recall the user's
@@ -252,7 +275,17 @@ Your job:
 - Then, when current or evidence-informed tips would help, call search_web
   once. Call search_web a second time only for a clearly different angle, such
   as practical Korean tips plus evidence-oriented English sources.
-- Do not repeat substantially similar searches.
+- When the user wants a vision board, motivational poster, celebration image,
+  or any visual, call generate_image with a vivid ENGLISH prompt.
+  * Vision board: compose a COLLAGE that combines MULTIPLE goals you found
+    (e.g. exercise, study/reading, sleep, travel) as distinct visual sections
+    in a single board, like a moodboard grid.
+  * Do NOT put any text, words, letters, or captions inside the image -
+    AI-rendered text (especially Korean) comes out garbled. Express each goal
+    with symbols and scenes only: dumbbells for exercise, stacked books for
+    reading, a moon/clock for sleep, a plane or mountains for travel, etc.
+  Call generate_image at most twice.
+- Do not repeat substantially similar searches or images.
 - After the tool results are returned, respond with only: SEARCH_DONE
 """
 
@@ -275,6 +308,9 @@ Your job:
 - Keep answers structured and actionable: empathize briefly, then give 3-5
   practical steps the user can try today.
 - Mention useful source names or URLs briefly when search results are provided.
+- If a generated image is described in the context, the app already displays it
+  to the user. Briefly celebrate or describe what it depicts in Korean; do NOT
+  paste the image URL into your answer.
 - Format every source as a Markdown link, for example
   [source name](https://example.com). Do not leave source URLs as plain text.
 - Do not present yourself as a therapist, doctor, or medical professional.
@@ -1790,6 +1826,55 @@ def make_search_goals_tool(goals_text: str):
     return search_goals
 
 
+@function_tool
+def generate_image(prompt: str) -> str:
+    """Generate a motivational image, vision board, or celebration poster.
+
+    Pass a vivid English description of the desired image. Use this when the user
+    wants a vision board, a motivational poster, or a visual celebration of a
+    goal or milestone.
+    """
+    call_count = IMAGE_CALL_COUNT.get()
+    if call_count is not None:
+        if call_count[0] >= MAX_IMAGE_CALLS_PER_MESSAGE:
+            append_run_event(f"`generate_image` tool 추가 호출 차단: {prompt[:40]}")
+            return (
+                "이미 이번 메시지에서 충분한 이미지를 생성했습니다. "
+                "추가 생성 없이 앞서 만든 이미지를 설명하세요."
+            )
+        call_count[0] += 1
+
+    clean = " ".join(prompt.split()).strip()
+    if not clean:
+        return "이미지 프롬프트가 비어 있습니다."
+
+    started = time.perf_counter()
+    append_run_event(f"`generate_image` tool 호출: {clean[:50]}")
+    seed = int(time.time() * 1000) % 100000
+    params = urlencode(
+        {
+            "width": IMAGE_WIDTH,
+            "height": IMAGE_HEIGHT,
+            "nologo": "true",
+            "model": "flux",
+            "seed": seed,
+        }
+    )
+    url = f"{POLLINATIONS_BASE_URL}{quote(clean, safe='')}?{params}"
+    append_run_event(
+        f"`generate_image` tool 완료: {format_seconds(time.perf_counter() - started)}"
+    )
+
+    images = IMAGE_RESULTS.get()
+    if images is not None:
+        images.append({"prompt": clean, "url": url})
+
+    return (
+        f"이미지를 생성했습니다 (프롬프트: {clean}). "
+        "사용자 화면에 이미지가 표시되니, 한국어로 짧게 축하하거나 설명해 주세요."
+    )
+
+
 def format_seconds(seconds: float | None) -> str:
     if seconds is None:
         return "unknown"
@@ -2192,6 +2277,25 @@ def merge_search_timings(
     return evidence
 
 
+def render_generated_images(evidence: dict[str, object] | None) -> None:
+    if not evidence:
+        return
+    images = evidence.get("images")
+    if not isinstance(images, list) or not images:
+        return
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        url = str(image.get("url") or "")
+        if not url:
+            continue
+        st.image(
+            url,
+            caption="🎨 Life Coach가 만든 이미지",
+            use_container_width=True,
+        )
+
+
 def render_run_evidence(evidence: dict[str, object] | None) -> None:
     if not evidence:
         return
@@ -2334,10 +2438,10 @@ def build_search_agent(
     thinking_mode: str,
     goals_text: str = "",
 ) -> Agent:
-    tools = [search_web]
+    tools = [search_web, generate_image]
     if goals_text and goals_text.strip():
         # search_goals first so the planner recalls personal goals before the web.
-        tools = [make_search_goals_tool(goals_text), search_web]
+        tools = [make_search_goals_tool(goals_text), search_web, generate_image]
     return Agent(
         name="Life Coach Researcher",
         model=build_openai_compatible_model(model, api_key),
@@ -2671,6 +2775,9 @@ def run_search_for_streaming_answer(
     queue_token = RUN_EVENT_QUEUE.set(event_queue)
     search_count_token = SEARCH_CALL_COUNT.set([0])
     goal_count_token = GOAL_SEARCH_CALL_COUNT.set([0])
+    image_results: list[dict[str, object]] = []
+    images_token = IMAGE_RESULTS.set(image_results)
+    image_count_token = IMAGE_CALL_COUNT.set([0])
 
     try:
         append_run_event("자동 모드: 개인 목표/웹 검색 먼저 안정 실행")
@@ -2683,7 +2790,7 @@ def run_search_for_streaming_answer(
             agent,
             prompt,
             session=search_session,
-            max_turns=4,
+            max_turns=8,
         )
         evidence = extract_run_evidence(result)
         append_run_event("`Runner.run_sync()` 검색 단계 완료")
@@ -2696,6 +2803,11 @@ def run_search_for_streaming_answer(
                     "seconds": timing.get("seconds"),
                 }
                 for timing in goal_timings
+            ]
+        if image_results:
+            evidence["images"] = [
+                {"prompt": img.get("prompt"), "url": img.get("url")}
+                for img in image_results
             ]
 
         context_sections: list[str] = []
@@ -2713,8 +2825,17 @@ def run_search_for_streaming_answer(
         ]
         if web_parts:
             context_sections.append("[웹 검색 결과]\n" + "\n\n".join(web_parts))
+        if image_results:
+            image_lines = [f"- {img.get('prompt')}" for img in image_results]
+            context_sections.append(
+                "[생성된 이미지] 아래 이미지를 사용자 화면에 이미 표시했습니다. "
+                "URL을 답변 본문에 넣지 말고, 어떤 이미지를 만들었는지 자연스럽게 "
+                "언급만 하세요:\n" + "\n".join(image_lines)
+            )
         return "\n\n".join(context_sections), evidence, list(run_events)
     finally:
+        IMAGE_CALL_COUNT.reset(image_count_token)
+        IMAGE_RESULTS.reset(images_token)
         GOAL_SEARCH_CALL_COUNT.reset(goal_count_token)
         GOALS_TIMINGS.reset(goals_token)
         SEARCH_CALL_COUNT.reset(search_count_token)
@@ -3399,6 +3520,8 @@ async def run_search_then_stream_answer(
     )
 
     stream_evidence["searches"] = search_evidence.get("searches", [])
+    stream_evidence["goal_searches"] = search_evidence.get("goal_searches", [])
+    stream_evidence["images"] = search_evidence.get("images", [])
     stream_evidence["events"] = stream_evidence.get("events") or search_events
     stream_evidence["total_seconds"] = time.perf_counter() - started
     stream_evidence["search_then_stream"] = True
@@ -3516,6 +3639,10 @@ div[class*="st-key-thinking-mode-select"] button {
   padding: 0.25rem 0.45rem;
   white-space: nowrap;
 }
+[data-testid="stChatInput"] textarea,
+[data-baseweb="base-input"] textarea {
+  max-height: 4.5rem;
+}
 div[class*="st-key-stop-run-"] {
   bottom: 4.1rem;
   position: fixed;
@@ -3600,6 +3727,7 @@ div[class*="st-key-stop-run-"] button:hover {
                 f"copy-history-{index}-{message['role']}",
                 copy_label,
             )
+            render_generated_images(message.get("evidence"))
             render_run_evidence(message.get("evidence"))
 
     model, thinking_mode = render_prompt_settings()
@@ -3730,6 +3858,7 @@ div[class*="st-key-stop-run-"] button:hover {
         if answer and not evidence.get("stopped"):
             with copy_placeholder:
                 render_copy_button(answer, f"copy-{run_id}", "출력 복사")
+        render_generated_images(evidence)
         render_run_evidence(evidence)
 
     st.session_state.messages.append(
