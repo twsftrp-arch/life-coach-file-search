@@ -1,0 +1,19 @@
+name: life-coach-file-search-agent-harness
+version: 0.1.0
+description: APM adoption source for life-coach-file-search.
+author: Sungmin Kim
+license: UNLICENSED
+
+targets:
+  - codex
+  - claude
+  - cursor
+  - gemini
+
+dependencies:
+  apm: []
+  mcp: []
+
+scripts:
+  validate: "apm compile --validate --local-only"
+  dry-run: "apm compile --dry-run --local-only --target codex,claude,cursor,gemini,agent-skills"
